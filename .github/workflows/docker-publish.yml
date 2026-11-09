@@ -1,0 +1,182 @@
+name: ci / docker publish
+
+# Build the Odysseus image and publish to GHCR.
+#   push to main -> :latest, :X.Y.Z            (curated release; main is fast-forwarded at releases)
+#   push to dev  -> :dev,    :X.Y.Z-dev.<sha>  (rolling dev + an immutable, traceable pin)
+# Multi-arch (linux/amd64 + linux/arm64): each arch builds on its own native
+# runner and pushes by digest, then a merge job stitches the digests into one
+# manifest list and applies the tags (faster + cleaner than QEMU emulation).
+# Registry: ghcr.io/<owner>/<repo>.
+
+on:
+  push:
+    branches: [dev, main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export image digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ runner.temp }}/digests"
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::The build did not produce an image digest."
+            exit 1
+          fi
+          touch "${{ runner.temp }}/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge and publish multi-architecture image
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read application version and commit
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -nE 's/^APP_VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' src/constants.py | head -n 1)"
+          if [ -z "${version}" ]; then
+            echo "::error::APP_VERSION is empty or could not be read from src/constants.py."
+            exit 1
+          fi
+          short_sha="${GITHUB_SHA:0:7}"
+          if [ -z "${short_sha}" ]; then
+            echo "::error::Unable to determine the current commit short SHA."
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "short_sha=${short_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download architecture digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-architecture manifest
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}"
+
+          shopt -s nullglob
+          digest_files=("${{ runner.temp }}/digests/"*)
+          if [ "${#digest_files[@]}" -ne 2 ]; then
+            echo "::error::Expected two architecture digests, found ${#digest_files[@]}."
+            exit 1
+          fi
+
+          manifest_refs=()
+          for digest_file in "${digest_files[@]}"; do
+            digest="$(basename "${digest_file}")"
+            manifest_refs+=("${image}@sha256:${digest}")
+          done
+
+          tags=()
+          verify_tag="dev"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            tags=("${image}:latest" "${image}:${VERSION}")
+            verify_tag="latest"
+          elif [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
+            tags=("${image}:dev" "${image}:${VERSION}-dev.${SHORT_SHA}")
+          else
+            echo "::notice::No release tag rules apply to ${GITHUB_REF}; continuing without release tags."
+          fi
+
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "${tag}")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${manifest_refs[@]}"
+          docker buildx imagetools inspect "${image}:${verify_tag}"
